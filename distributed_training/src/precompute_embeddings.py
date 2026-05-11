@@ -12,10 +12,6 @@ import gc
 import subprocess
 from datetime import timedelta
 
-# Cấu hình NCCL và Logging
-os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
-os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
-
 def check_gcs_file_exists(gcs_path):
     """Kiểm tra sự tồn tại của file trên GCS bằng gsutil stat."""
     result = subprocess.run(["gsutil", "-q", "stat", gcs_path], capture_output=True)
@@ -23,163 +19,119 @@ def check_gcs_file_exists(gcs_path):
 
 def precompute_item_embeddings():
     """
-    Sử dụng đa GPU để mã hóa sản phẩm thành vector.
-    Chiến thuật 'Immortal & Efficient':
-    - Checkpoint per file: Lưu kết quả từng file Parquet lên GCS ngay khi xong.
-    - RAM Efficient: Mỗi GPU chỉ load đúng 1/4 file thông qua Row Group reading.
-    - File-based Barrier: Đồng bộ bằng file vật lý để chống NCCL Timeout.
+    Chiến thuật 'Độc lập tác chiến' (Independent Workers):
+    - Mỗi GPU xử lý một nhóm file Parquet riêng biệt (Sharding by File).
+    - KHÔNG ĐỒNG BỘ giữa chừng -> Loại bỏ 100% rủi ro treo (Deadlock) hoặc NCCL Timeout.
+    - Hỗ trợ Resume mạnh mẽ: Tự động bỏ qua các file đã hoàn tất từ phiên chạy trước.
+    - RAM Efficient: Phù hợp với file Parquet 150MB.
     """
     rank = TrainingConfig.RANK
     world_size = TrainingConfig.WORLD_SIZE
     device = TrainingConfig.DEVICE
     logger = logging.LoggerAdapter(logging.getLogger("precompute"), {'rank': rank})
 
-    # 0. Khởi tạo Distributed
+    # 0. Khởi tạo Distributed (Cần thiết để Rank 0 gộp file cuối cùng)
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl", timeout=timedelta(minutes=180))
 
-    # 1. Chuẩn bị đường dẫn
     chunks_gcs_dir = f"{TrainingConfig.GCS_PREPARED_DATA}/chunks"
-    tmp_sync_dir = "/tmp/embeddings_sync"
     os.makedirs(TrainingConfig.LOCAL_DATA_DIR, exist_ok=True)
-    os.makedirs(tmp_sync_dir, exist_ok=True)
     
-    # 2. Khảo sát danh sách file
+    # 1. Lấy danh sách file Parquet
     path = TrainingConfig.GCS_ITEM_NODES if TrainingConfig.IS_CLOUD else "data/item_nodes"
     import gcsfs
     fs = gcsfs.GCSFileSystem() if TrainingConfig.IS_CLOUD else None
-    
     if TrainingConfig.IS_CLOUD:
         all_files = sorted([f"gs://{f}" for f in fs.ls(path) if f.endswith(".parquet")])
     else:
         import glob
         all_files = sorted(glob.glob(os.path.join(path, "*.parquet")))
 
+    # 2. CHIA PHẦN: Mỗi GPU đảm nhận các file tương ứng với Rank của mình (Ví dụ: GPU 0 làm file 0, 4, 8, 12)
+    my_files = all_files[rank::world_size]
+    
     if rank == 0:
-        logger.info(f"==> PHÁT HIỆN {len(all_files)} FILE PARQUET. BẮT ĐẦU CHẾ ĐỘ INCREMENTAL...")
+        logger.info(f"==> TỔNG CỘNG: {len(all_files)} FILE. MỖI GPU SẼ XỬ LÝ KHOẢNG {len(my_files)} FILE.")
     
     model = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2', device=device)
 
-    # 3. Vòng lặp xử lý từng file Parquet
-    for f_idx, f_path in enumerate(all_files):
+    # 3. Vòng lặp xử lý độc lập
+    for f_idx, f_path in enumerate(my_files):
         f_name = os.path.basename(f_path).replace(".parquet", "")
         done_flag_gcs = f"{chunks_gcs_dir}/{f_name}_done.txt"
         
-        # Checkpoint: Bỏ qua nếu file này đã xử lý xong và có trên GCS
+        # Checkpoint: Nếu file này đã xong thì bỏ qua ngay
         if check_gcs_file_exists(done_flag_gcs):
-            if rank == 0: logger.info(f"[{f_idx+1}/{len(all_files)}] SKIP: {f_name} (Đã tồn tại)")
+            logger.info(f"SKIP: {f_name} (Đã hoàn tất)")
             continue
             
-        if rank == 0: logger.info(f"[{f_idx+1}/{len(all_files)}] PROCESSING: {f_name}...")
+        logger.info(f"PROCESSING: {f_name} ({f_idx+1}/{len(my_files)})")
 
         try:
-            # SỬ DỤNG PARQUETFILE ĐỂ CHỈ ĐỌC PHẦN DỮ LIỆU CẦN THIẾT (TIẾT KIỆM RAM)
-            pf = pq.ParquetFile(f_path, filesystem=fs)
-            num_row_groups = pf.num_row_groups
+            # Đọc nguyên file Parquet (150MB an toàn cho 1 GPU)
+            table = pq.read_table(f_path, columns=['product_id', 'asin', 'full_text'], filesystem=fs)
+            texts = table['full_text'].to_pylist()
+            ids = table['product_id'].to_pylist()
+            asins = table['asin'].to_pylist()
+            del table
             
-            # Chia Row Groups cho các Rank (Ví dụ 4 GPU chia đều các block dữ liệu trong file)
-            groups_per_rank = (num_row_groups + world_size - 1) // world_size
-            my_groups = list(range(rank * groups_per_rank, min((rank + 1) * groups_per_rank, num_row_groups)))
+            # Encode toàn bộ file
+            embs = model.encode(texts, batch_size=512, convert_to_numpy=True, show_progress_bar=False)
             
-            texts, ids, asins = [], [], []
-            if my_groups:
-                # CHỈ LOAD CÁC ROW GROUPS ĐƯỢC PHÂN CÔNG VÀO RAM
-                table = pf.read_row_groups(my_groups, columns=['product_id', 'asin', 'full_text'])
-                texts = table['full_text'].to_pylist()
-                ids = table['product_id'].to_pylist()
-                asins = table['asin'].to_pylist()
-                del table
-                gc.collect()
-
-            # Encode phần dữ liệu của rank này
-            if texts:
-                embs = model.encode(texts, batch_size=512, convert_to_numpy=True, show_progress_bar=False)
-                
-                local_idx_data = []
-                for i, (p_id, asin) in enumerate(zip(ids, asins)):
-                    local_idx_data.append({"p_id": p_id, "asin": asin})
-                
-                # Lưu tạm local file cho bước gộp
-                np.save(f"{tmp_sync_dir}/emb_{rank}.npy", embs)
-                with open(f"{tmp_sync_dir}/idx_{rank}.pkl", "wb") as f: pickle.dump(local_idx_data, f)
-                del embs, texts, ids, asins
-            else:
-                # Rank này không có Row Group nào (do file quá ít dữ liệu)
-                # Đảm bảo xóa file cũ nếu có
-                for ext in [".npy", ".pkl"]:
-                    p = f"{tmp_sync_dir}/" + ("emb_" if ext==".npy" else "idx_") + f"{rank}{ext}"
-                    if os.path.exists(p): os.remove(p)
-
-            # ĐỒNG BỘ BƯỚC 1: Đợi cả 4 GPU encode xong file này
-            sync_file = f"{tmp_sync_dir}/sync_{f_name}_{rank}.txt"
-            with open(sync_file, "w") as f: f.write("done")
+            # Tạo index nội bộ cho chunk này
+            chunk_index = {}
+            for i, (p_id, asin) in enumerate(zip(ids, asins)):
+                if p_id: chunk_index[p_id] = i
+                if asin: chunk_index[asin] = i
             
-            t_wait = time.time()
-            while True:
-                done_ranks = [x for x in os.listdir(tmp_sync_dir) if x.startswith(f"sync_{f_name}_")]
-                if len(done_ranks) >= world_size: break
-                if time.time() - t_wait > 7200: raise TimeoutError(f"Timeout chờ encode file {f_name}")
-                time.sleep(5)
-
-            # RANK 0: Gộp kết quả và đẩy lên GCS
-            if rank == 0:
-                all_embs, chunk_index, offset = [], {}, 0
-                for r in range(world_size):
-                    e_p, i_p = f"{tmp_sync_dir}/emb_{r}.npy", f"{tmp_sync_dir}/idx_{r}.pkl"
-                    if os.path.exists(e_p):
-                        r_embs = np.load(e_p)
-                        with open(i_p, "rb") as f_in: r_idx_list = pickle.load(f_in)
-                        all_embs.append(r_embs)
-                        for i, meta in enumerate(r_idx_list):
-                            g_idx = offset + i
-                            if meta['p_id']: chunk_index[meta['p_id']] = g_idx
-                            if meta['asin']: chunk_index[meta['asin']] = g_idx
-                        offset += len(r_embs)
-                
-                if all_embs:
-                    combined = np.vstack(all_embs)
-                    loc_npy, loc_pkl = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.npy", f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.pkl"
-                    np.save(loc_npy, combined)
-                    with open(loc_pkl, "wb") as f_out: pickle.dump(chunk_index, f_out)
-                    
-                    subprocess.run(["gsutil", "-m", "cp", loc_npy, f"{chunks_gcs_dir}/{f_name}.npy"], check=True)
-                    subprocess.run(["gsutil", "-m", "cp", loc_pkl, f"{chunks_gcs_dir}/{f_name}.pkl"], check=True)
-                    subprocess.run(["gsutil", "cp", "/dev/null", done_flag_gcs], check=True)
-                    os.remove(loc_npy); os.remove(loc_pkl)
-                    logger.info(f"==> DONE & UPLOADED CHUNK: {f_name}")
-                
-                # Báo cho các Rank khác là đã Upload xong
-                with open(f"{tmp_sync_dir}/upload_done_{f_name}.txt", "w") as f: f.write("done")
-
-            # ĐỒNG BỘ BƯỚC 2: Các GPU khác đợi Rank 0 upload xong mới được đi tiếp
-            t_wait_gcs = time.time()
-            while not os.path.exists(f"{tmp_sync_dir}/upload_done_{f_name}.txt"):
-                if time.time() - t_wait_gcs > 3600: raise TimeoutError(f"Timeout chờ Rank 0 upload GCS cho file {f_name}")
-                time.sleep(5)
-
-            # DỌN DẸP: Chỉ Rank 0 mới có quyền dọn dẹp các file sync sau khi tất cả đã vượt qua Barrier 2
-            if rank == 0:
-                for r in range(world_size):
-                    for prefix in ["emb_", "idx_", f"sync_{f_name}_"]:
-                        for ext in [".npy", ".pkl", ".txt"]:
-                            p = f"{tmp_sync_dir}/{prefix}{r}{ext}"
-                            if os.path.exists(p): os.remove(p)
-                os.remove(f"{tmp_sync_dir}/upload_done_{f_name}.txt")
+            # Lưu và upload trực tiếp kết quả
+            loc_npy = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.npy"
+            loc_pkl = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.pkl"
+            np.save(loc_npy, embs)
+            with open(loc_pkl, "wb") as f_out: 
+                pickle.dump(chunk_index, f_out)
             
+            # Upload lên GCS
+            subprocess.run(["gsutil", "cp", loc_npy, f"{chunks_gcs_dir}/{f_name}.npy"], check=True)
+            subprocess.run(["gsutil", "cp", loc_pkl, f"{chunks_gcs_dir}/{f_name}.pkl"], check=True)
+            subprocess.run(["gsutil", "cp", "/dev/null", done_flag_gcs], check=True) # Flag hoàn tất
+            
+            # Dọn dẹp memory và local file
+            os.remove(loc_npy); os.remove(loc_pkl)
+            del embs, texts, ids, asins
             gc.collect()
-
+            
         except Exception as e:
-            logger.error(f"LỖI KHI XỬ LÝ FILE {f_name}: {e}")
+            logger.error(f"LỖI TẠI FILE {f_name}: {e}")
             raise e
 
-    # 4. HỢP NHẤT CUỐI CÙNG (CHỈ RANK 0 THỰC HIỆN)
+    # 4. HỢP NHẤT (Chỉ Rank 0 thực hiện sau khi tất cả các mảnh đã xong)
     if rank == 0:
+        logger.info("Đang đợi các GPU khác hoàn thành phần việc của mình...")
+        t_start = time.time()
+        while True:
+            # Kiểm tra nhanh bằng cách liệt kê danh sách file trên GCS thay vì gọi stat từng file
+            result = subprocess.run(["gsutil", "ls", f"{chunks_gcs_dir}/*_done.txt"], capture_output=True, text=True)
+            done_files = result.stdout.splitlines()
+            done_count = len(done_files)
+            
+            if done_count >= len(all_files):
+                break
+            
+            # Timeout 5 tiếng
+            if time.time() - t_start > 18000:
+                raise TimeoutError("Quá thời gian chờ các GPU khác hoàn thành Precompute.")
+            
+            logger.info(f"Tiến độ tổng: {done_count}/{len(all_files)} file đã xong...")
+            time.sleep(60)
+
+        # Gọi hàm hợp nhất cuối cùng
         from src.gcs_manager import merge_precomputed_chunks
         merge_precomputed_chunks()
-        logger.info("==> TOÀN BỘ QUY TRÌNH PRECOMPUTE ĐÃ HOÀN TẤT!")
+        logger.info("==> TẤT CẢ QUY TRÌNH ĐÃ HOÀN TẤT THÀNH CÔNG!")
 
     if world_size > 1:
-        dist.barrier() # Đợi Rank 0 hoàn tất merge
+        dist.barrier() # Đồng bộ lần cuối để kết thúc job an toàn
 
 if __name__ == "__main__":
     precompute_item_embeddings()
