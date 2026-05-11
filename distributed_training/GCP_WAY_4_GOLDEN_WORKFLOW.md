@@ -34,7 +34,7 @@ gcloud compute instances create coordinator-vm \
 Cần tạo Repository của mình trên GCP (artifact registry).
 
 ```bash
-    gcloud artifacts repositories create recsys-repo-2 \
+    gcloud artifacts repositories create recsys-repo \
         --repository-format=docker \
         --location=asia-southeast1 \
         --description="Kho chua Docker Image"
@@ -108,6 +108,11 @@ Gõ lệnh kiểm tra dung lượng ổ cứng:
    ```bash
    df -h
    ```
+
+Xem log chạy Custom Job trên terminal:
+```bash
+   gcloud ai custom-jobs stream-logs [JOB_ID]
+```
 
 ## 3. Luồng làm việc hàng ngày (Daily Workflow)
 

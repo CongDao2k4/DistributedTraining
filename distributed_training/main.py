@@ -50,14 +50,11 @@ def run_pipeline(baseline_id):
             if TrainingConfig.RANK == 0:
                 logger.info("!!! KHÔNG TÌM THẤY EMBEDDINGS LOCAL. ĐANG KÍCH HOẠT PRECOMPUTE...")
             
-            # Chạy Precompute (Sử dụng 4 GPU)
+            # Chạy Precompute (Sử dụng 4 GPU - Tự động Resume và Gộp file)
             precompute_item_embeddings()
-            dist.barrier()
             
-            # Chỉ Rank 0 thực hiện upload lên GCS để dành cho các Job sau
-            if TrainingConfig.RANK == 0:
-                from src.gcs_manager import upload_precomputed_data
-                upload_precomputed_data()
+            # Sau khi xong, tất cả các Rank sẽ tự động đồng bộ qua barrier nội bộ của hàm trên
+            # Dữ liệu lúc này đã sẵn sàng ở LOCAL_DATA_DIR cho các bước tiếp theo
         
         # 2. Nạp dữ liệu Vector (Memory-Mapped)
         embedding_lookup = load_precomputed_embeddings()

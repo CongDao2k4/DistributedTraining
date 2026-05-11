@@ -93,6 +93,11 @@ vì dữ liệu lần hỏng trước đó  thì các layer-cache download xong 
 bash distributed_training/submit_job.sh 1
 ```
 
+Xem log chạy Custom Job trên terminal:
+```bash
+   gcloud ai custom-jobs stream-logs [JOB_ID]
+```
+
 - Lưu ý quan trọng khi chạy:
   - Bật API: Khi terminal hỏi `Would you like to enable and retry (y/N)?`, bạn hãy gõ `y` rồi Enter. Quá trình này chỉ mất khoảng 1-2 phút.
   - Docker: Đảm bảo Docker Desktop của bạn đang chạy (trạng thái màu xanh).
