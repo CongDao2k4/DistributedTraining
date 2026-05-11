@@ -1,0 +1,25 @@
+# Loại bỏ các thư mục môi trường ảo (Thủ phạm chính gây chậm)
+eval_env/
+venv/
+.venv/
+env/
+
+# Loại bỏ dữ liệu cục bộ (Dữ liệu đã có trên GCS rồi, không nên nén vào Docker)
+data/
+*.pkl
+*.parquet
+*.snappy.parquet
+
+# Loại bỏ các file log và checkpoint
+*.log
+models_checkpoints/
+training_pipeline.log
+
+# Loại bỏ file hệ thống và Git
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.ipynb_checkpoints/

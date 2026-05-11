@@ -1,0 +1,66 @@
+BÁO CÁO NGẮN: QUY TRÌNH ETL SPARK CHO DỮ LIỆU 55GB TRÊN GOOGLE CLOUD
+Mục tiêu: xử lý ổn định, tránh tràn RAM, tăng tốc đọc/xử lý và giảm chi phí đọc dữ liệu
+Ngày lập: 10/05/2026 | Phạm vi: etl_item_nodes_v2.py, etl_interactions_v2.py, evaluation_dataset_v2.py, data_validator_v2.py
+1. Tóm tắt điều hành
+Pipeline ETL hiện tại được thiết kế theo hướng “Spark-native”: đọc JSONL bằng schema tường minh, chuẩn hóa dữ liệu bằng DataFrame API, hợp nhất dữ liệu Amazon và Việt Nam về schema chung, ghi kết quả trung gian sang Parquet, sau đó tạo bộ evaluation ở dạng ID-only. Cách làm này phù hợp với dữ liệu khoảng 55GB vì hạn chế suy luận schema, tránh kéo toàn bộ dữ liệu về driver, tận dụng xử lý phân tán, và giảm dung lượng đọc lại ở các bước sau.
+Điểm mạnh nổi bật là các bước xử lý đều ưu tiên select cột cần thiết, chuẩn hóa bằng hàm Spark thay vì Python loop, ghi Parquet để tái sử dụng, cache bằng MEMORY_AND_DISK cho dữ liệu cần đọc nhiều lần, và tránh join metadata text lớn trong bước tạo negative candidates. Để tiếp tục tối ưu trên Google Cloud, nên bổ sung chiến lược partition/repartition theo workload, kiểm soát số lượng file nhỏ, dùng autoscaling/ephemeral cluster hoặc serverless Spark, đặt bucket cùng region với compute, và theo dõi chi phí request/đọc dữ liệu trên Cloud Storage.
+2. Quy trình ETL hiện tại
+2.1. Chuẩn hóa dữ liệu sản phẩm
+Bước item nodes đọc metadata từ file JSONL của VN và Amazon bằng schema định nghĩa sẵn. VN dùng các trường như product_id, asin, product_name, specifications, description, breadcrumb; Amazon dùng parent_asin, asin, title, features, description, main_category và details. Sau khi đọc, dữ liệu được chuẩn hóa về các cột chung: product_id, asin, product_name, category, full_text, parsed_specs và domain.
+Dùng schema tường minh để Spark không phải scan dữ liệu lớn nhằm đoán schema, nhờ đó giảm thời gian đọc đầu vào và giảm request tới Cloud Storage.
+Dùng spark_standardize và spark_clean_text để chuẩn hóa chuỗi, loại HTML/ký tự thừa, lower/trim, xử lý cả array và string trong DataFrame.
+Phân loại category bằng rule đơn giản từ breadcrumb và tên sản phẩm; đây là bước nhẹ, chạy phân tán và đủ dùng cho negative mining.
+Ghi output sang Parquet, coalesce(16), và dropDuplicates theo product_id + asin để không mất biến thể sản phẩm con.
+2.2. Chuẩn hóa dữ liệu tương tác/review
+Bước interactions chuẩn hóa review của VN và Amazon về schema chung gồm user_id, product_id, asin, rating, review_text, main_category, domain. Code dùng schema tường minh cho hai nguồn, map các trường tương ứng, unionByName, loại dòng thiếu user_id/product_id, khử trùng theo user_id + product_id, rồi ghi Parquet với coalesce(32).
+Cách khử trùng theo user_id + product_id làm giảm kích thước downstream và tránh training/evaluation bị lệch bởi review lặp.
+Ghi Parquet sau bước làm sạch giúp các bước sau chỉ đọc dữ liệu cột cần thiết thay vì đọc lại JSONL 55GB.
+2.3. Tạo evaluation dataset
+Bước evaluation đọc item Parquet, chỉ select product_id, asin, category và domain. Positive pairs được tạo bằng cách match ASIN giữa Amazon và VN, có trim/lower để tránh lệch do khoảng trắng hoặc chữ hoa/thường. Negative mining tách thành hard negatives cùng category và easy negatives random; cả hai pool đều bị giới hạn trước khi join để tránh bùng nổ dữ liệu. Kết quả cuối chỉ lưu query_id, candidate_ids và labels, không join metadata text trong Spark.
+Việc chỉ lưu ID-only là quyết định quan trọng nhất để tránh RAM tăng đột biến, vì full_text/specs_text thường chiếm phần lớn bộ nhớ.
+Hard pool giới hạn khoảng 500 item/category và easy pool khoảng 2.000 item giúp tạo đủ 99 negatives/query nhưng không crossJoin toàn bộ tập VN.
+Broadcast chỉ nên dùng với pool nhỏ đã giới hạn; không broadcast bảng lớn 55GB.
+3. Xử lý dữ liệu 55GB và tránh tràn RAM
+Với dữ liệu 55GB, nguyên tắc chính là không đưa dữ liệu về driver, không collect dữ liệu thô, không dùng pandas cho file lớn, và không cache toàn bộ nếu không tái sử dụng nhiều lần. Pipeline hiện tại đã đi đúng hướng vì sử dụng Spark DataFrame lazy execution, schema tường minh, Parquet trung gian và StorageLevel.MEMORY_AND_DISK.
+Rủi ro	Cách đang/ nên xử lý	Tác động
+Spark phải đoán schema JSONL	Định nghĩa VN/AMZ schema trước khi đọc	Giảm scan đầu vào, giảm thời gian và I/O
+Cross join làm nổ dữ liệu	Giới hạn hard/easy negative pool trước khi broadcast	Kiểm soát số record sinh ra
+Cache tràn memory executor	Dùng MEMORY_AND_DISK, unpersist sau khi dùng	Spill sang disk thay vì fail job
+Đọc quá nhiều cột text	Select cột cần thiết, evaluation lưu ID-only	Giảm RAM, shuffle và chi phí đọc
+Quá nhiều file nhỏ	Coalesce/repartition trước khi ghi, mục tiêu 256-512MB/file	Giảm overhead request và planning
+Cấu hình khuyến nghị cho job 55GB: đặt spark.sql.files.maxPartitionBytes khoảng 128MB-256MB để đủ song song nhưng không tạo quá nhiều task; spark.sql.shuffle.partitions khoảng 2-3 lần tổng số vCPU tối đa của cluster; bật Adaptive Query Execution; giữ dynamic allocation/autoscaling nếu chạy trên Dataproc/Managed Service for Apache Spark. Khi ghi dữ liệu cột-partitioned, dùng repartition theo khóa partition trước khi write; với output không partition, coalesce chỉ nên dùng ở cuối pipeline để giảm số file, không dùng quá sớm vì có thể làm giảm song song.
+4. Tối ưu tốc độ đọc/xử lý
+Ưu tiên Parquet/Snappy cho dữ liệu trung gian và dữ liệu đã làm sạch. Parquet cho phép đọc theo cột, nên các bước chỉ cần ID/category không phải đọc full_text/review_text.
+Tách pipeline thành bronze/silver/gold: bronze là JSONL raw, silver là item/review Parquet đã chuẩn hóa, gold là evaluation ID-only. Các lần chạy lại model/evaluation nên đọc silver/gold thay vì JSONL raw.
+Giảm số lần action: validator đã gom nhiều thống kê vào một agg.collect thay vì nhiều count riêng. Nên áp dụng tương tự cho các bước debug trong evaluation; các count debug nên bật/tắt bằng flag vì mỗi count là một Spark job và có thể đọc lại GCS.
+Không dùng UDF Python nếu Spark SQL function làm được. Code hiện tại chủ yếu dùng concat_ws, regexp_replace, lower, trim, from_json; đây là hướng tốt vì Spark có thể tối ưu execution plan.
+Kiểm soát skew ở join theo category/asin. Nếu một category “other” quá lớn, nên loại khỏi hard negative hoặc xử lý sampling riêng như pipeline hiện tại đã làm.
+Theo dõi Spark UI: thời gian spent ở input read, shuffle read/write, spill memory/disk, số task bị retry và kích thước output file. Đây là cơ sở để chọn lại partition, executor memory và số worker.
+5. Giảm chi phí đọc dữ liệu trên Google Cloud
+Chi phí trên Cloud Storage không chỉ đến từ dung lượng lưu trữ mà còn từ operation charges, retrieval fees và network usage. Vì vậy, tối ưu chi phí đọc cần kết hợp giảm số lần đọc, giảm số object phải list/get, đặt đúng storage class và đặt compute gần bucket.
+Lưu dữ liệu đã chuẩn hóa dưới dạng Parquet theo cột và chỉ đọc cột cần thiết. Đây là cách giảm trực tiếp byte read cho các lần chạy lại.
+Hạn chế file nhỏ: nhiều object nhỏ làm tăng số request/list/get và tăng overhead Spark planning. Nên giữ file Parquet khoảng 256-512MB khi khả thi.
+Đặt bucket cùng region với Dataproc/Serverless Spark để tránh phí/độ trễ data transfer giữa vùng. Với dữ liệu 55GB, khác region có thể làm chậm job và phát sinh network cost.
+Dùng ephemeral cluster hoặc serverless Spark cho batch ETL định kỳ để không trả tiền idle time; bật autoscaling để thêm/bớt worker theo workload.
+Với dữ liệu ít thay đổi nhưng đọc lặp lại nhiều lần cho training/evaluation, cân nhắc Rapid Cache; với dữ liệu raw ít truy cập sau khi đã chuyển sang Parquet, cân nhắc Autoclass hoặc lifecycle policy.
+Tách raw và curated bucket/prefix. Raw JSONL có thể chuyển sang lớp lưu trữ rẻ hơn sau khi đã tạo silver Parquet; silver/gold đang dùng thường xuyên nên giữ ở Standard để tránh retrieval fee.
+6. Kết luận và ưu tiên triển khai
+Pipeline ETL hiện tại đã có nền tảng tốt để xử lý 55GB: schema tường minh, Spark DataFrame, Parquet trung gian, cache MEMORY_AND_DISK, ID-only evaluation và giới hạn negative pool. Để tăng độ ổn định và giảm chi phí hơn nữa, nên ưu tiên ba nhóm việc sau:
+Chuẩn hóa cấu hình Spark theo cluster: AQE bật, shuffle partitions theo vCPU, maxPartitionBytes 128-256MB, kiểm tra spill và skew trên Spark UI.
+Tối ưu layout dữ liệu trên GCS: Parquet 256-512MB/file, phân vùng theo domain/category nếu truy vấn thường lọc theo các cột này, giảm file nhỏ và giảm số lần đọc raw JSONL.
+Quản trị chi phí Cloud: chạy batch bằng ephemeral/serverless + autoscaling, bucket cùng region với compute, storage class/lifecycle cho raw data, và cache nếu workload đọc lặp.
+Nếu cần cải thiện thêm trong code, thay đổi có tác động nhanh nhất là thêm chế độ “production/debug”: trong production, hạn chế các count debug trước khi ghi; chỉ validate sau khi write bằng một action tổng hợp. Tiếp theo là chuẩn hóa repartition/coalesce theo kích thước thực tế của output, thay vì dùng số cố định 16/32 cho mọi lần chạy.
+7. Checklist vận hành đề xuất
+Trước khi chạy: kiểm tra tổng số file, kích thước file trung bình, số file nhỏ dưới 16MB và region của bucket so với region compute.
+Trong khi chạy: bật Spark event logs, theo dõi input bytes, shuffle spill, executor lost, task retry, skew task và thời gian từng stage.
+Sau khi chạy: ghi lại số lượng output row, số lượng output file, kích thước trung bình mỗi Parquet file, chi phí GCS operation/read ước tính và thời gian chạy toàn pipeline.
+Ngưỡng cảnh báo: nếu nhiều task spill disk, tăng executor memory hoặc giảm shuffle partitions; nếu task quá ít và CPU thấp, tăng partition/input parallelism; nếu có quá nhiều file nhỏ, gom file ở bước write cuối.
+Chuẩn hóa output: đặt tên prefix theo ngày chạy hoặc version dataset, ví dụ gs://bucket/silver/items/run_date=YYYY-MM-DD/ để dễ rollback và so sánh chi phí giữa các lần chạy.
+Chiến lược rerun: khi thay đổi logic category hoặc mapping schema, chỉ rerun silver item/review; khi chỉ đổi evaluation mining, đọc lại silver item Parquet và không đọc raw JSONL.
+Nguồn tham chiếu
+Mã nguồn: etl_item_nodes_v2.py - chuẩn hóa metadata VN/Amazon, schema tường minh, ghi Parquet coalesce(16).
+Mã nguồn: etl_interactions_v2.py - chuẩn hóa review VN/Amazon, filter, dropDuplicates, ghi Parquet coalesce(32).
+Mã nguồn: evaluation_dataset_v2.py - positive matching, safe negative mining, ID-only output.
+Mã nguồn: data_validator_v2.py - persist MEMORY_AND_DISK và gom thống kê vào một action.
+Google Cloud: Spark job tuning tips - partitioning, shuffling, Parquet, dynamic allocation, autoscaling.
+Google Cloud: Cloud Storage pricing, request-rate guidelines, Rapid Cache và Autoclass.

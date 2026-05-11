@@ -1,0 +1,22 @@
+# Thu vien cot loi cho Training
+torch>=2.0.0
+torchvision
+torchaudio
+
+# Giao tiep voi Google Cloud Storage
+gcsfs
+google-cloud-storage
+fsspec
+
+# Xu ly du lieu Big Data
+pandas
+pyarrow
+fastparquet
+
+# Deep Learning Utilities
+sentence-transformers==2.7.0
+transformers==4.40.1
+datasets>=2.19.0
+numpy
+tqdm
+rank_bm25
