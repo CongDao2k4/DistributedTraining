@@ -34,7 +34,7 @@ gcloud compute instances create coordinator-vm \
 Cần tạo Repository của mình trên GCP (artifact registry).
 
 ```bash
-    gcloud artifacts repositories create recsys-repo \
+    gcloud artifacts repositories create recsys-repo-2 \
         --repository-format=docker \
         --location=asia-southeast1 \
         --description="Kho chua Docker Image"

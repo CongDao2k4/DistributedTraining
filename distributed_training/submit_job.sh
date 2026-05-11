@@ -30,7 +30,7 @@ fi
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 IMAGE_NAME="distributed-training"
 # Sử dụng Artifact Registry cùng Region (asia-southeast1) để tránh lỗi kéo image liên lục địa
-REPO_NAME="recsys-repo"
+REPO_NAME="recsys-repo-2"
 IMAGE_URI="asia-southeast1-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$IMAGE_NAME:v_$TIMESTAMP"
 
 # --- 4. KIỂM TRA PROJECT ID ---
