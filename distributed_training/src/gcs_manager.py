@@ -88,11 +88,11 @@ def merge_precomputed_chunks():
     
     for npy_f, n_rows in file_info:
         logger.info(f"Đang gộp {npy_f} ({n_rows:,} rows)...")
-        # Đọc mảnh
+        # Đọc mảnh bằng mmap_mode='r' để KHÔNG tốn RAM (chỉ ánh xạ bộ nhớ)
         data_path = os.path.join(local_dir, npy_f)
-        data = np.load(data_path)
+        data = np.load(data_path, mmap_mode='r')
         
-        # Ghi vào vị trí tương ứng trong file tổng
+        # Ghi vào vị trí tương ứng trong file tổng (SSD -> SSD)
         fp[curr_offset : curr_offset + n_rows] = data
         
         # Đọc và offset lại Index

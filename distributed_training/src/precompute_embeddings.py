@@ -110,7 +110,7 @@ def precompute_item_embeddings():
                     p = f"{tmp_sync_dir}/" + ("emb_" if ext==".npy" else "idx_") + f"{rank}{ext}"
                     if os.path.exists(p): os.remove(p)
 
-            # ĐỒNG BỘ: Đợi các GPU khác xong file này bằng File-based Barrier
+            # ĐỒNG BỘ BƯỚC 1: Đợi cả 4 GPU encode xong file này
             sync_file = f"{tmp_sync_dir}/sync_{f_name}_{rank}.txt"
             with open(sync_file, "w") as f: f.write("done")
             
@@ -118,23 +118,17 @@ def precompute_item_embeddings():
             while True:
                 done_ranks = [x for x in os.listdir(tmp_sync_dir) if x.startswith(f"sync_{f_name}_")]
                 if len(done_ranks) >= world_size: break
-                if time.time() - t_wait > 1800: raise TimeoutError(f"Timeout chờ đồng bộ file {f_name}")
+                if time.time() - t_wait > 7200: raise TimeoutError(f"Timeout chờ encode file {f_name}")
                 time.sleep(5)
 
-            # RANK 0: Gộp kết quả của file Parquet này và đẩy lên GCS
+            # RANK 0: Gộp kết quả và đẩy lên GCS
             if rank == 0:
-                all_embs = []
-                chunk_index = {}
-                offset = 0
-                
+                all_embs, chunk_index, offset = [], {}, 0
                 for r in range(world_size):
-                    e_p = f"{tmp_sync_dir}/emb_{r}.npy"
-                    i_p = f"{tmp_sync_dir}/idx_{r}.pkl"
+                    e_p, i_p = f"{tmp_sync_dir}/emb_{r}.npy", f"{tmp_sync_dir}/idx_{r}.pkl"
                     if os.path.exists(e_p):
                         r_embs = np.load(e_p)
-                        with open(i_p, "rb") as f_in:
-                            r_idx_list = pickle.load(f_in)
-                        
+                        with open(i_p, "rb") as f_in: r_idx_list = pickle.load(f_in)
                         all_embs.append(r_embs)
                         for i, meta in enumerate(r_idx_list):
                             g_idx = offset + i
@@ -144,26 +138,34 @@ def precompute_item_embeddings():
                 
                 if all_embs:
                     combined = np.vstack(all_embs)
-                    loc_npy = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.npy"
-                    loc_pkl = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.pkl"
-                    
+                    loc_npy, loc_pkl = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.npy", f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.pkl"
                     np.save(loc_npy, combined)
                     with open(loc_pkl, "wb") as f_out: pickle.dump(chunk_index, f_out)
                     
-                    # Upload lên GCS Chunks
                     subprocess.run(["gsutil", "-m", "cp", loc_npy, f"{chunks_gcs_dir}/{f_name}.npy"], check=True)
                     subprocess.run(["gsutil", "-m", "cp", loc_pkl, f"{chunks_gcs_dir}/{f_name}.pkl"], check=True)
                     subprocess.run(["gsutil", "cp", "/dev/null", done_flag_gcs], check=True)
-                    
                     os.remove(loc_npy); os.remove(loc_pkl)
                     logger.info(f"==> DONE & UPLOADED CHUNK: {f_name}")
+                
+                # Báo cho các Rank khác là đã Upload xong
+                with open(f"{tmp_sync_dir}/upload_done_{f_name}.txt", "w") as f: f.write("done")
 
-            # Dọn dẹp rác đồng bộ sau mỗi file để chuẩn bị cho file tiếp theo
-            for r in range(world_size):
-                for prefix in ["emb_", "idx_", f"sync_{f_name}_"]:
-                    for ext in [".npy", ".pkl", ".txt"]:
-                        p = f"{tmp_sync_dir}/{prefix}{r}{ext}"
-                        if os.path.exists(p): os.remove(p)
+            # ĐỒNG BỘ BƯỚC 2: Các GPU khác đợi Rank 0 upload xong mới được đi tiếp
+            t_wait_gcs = time.time()
+            while not os.path.exists(f"{tmp_sync_dir}/upload_done_{f_name}.txt"):
+                if time.time() - t_wait_gcs > 3600: raise TimeoutError(f"Timeout chờ Rank 0 upload GCS cho file {f_name}")
+                time.sleep(5)
+
+            # DỌN DẸP: Chỉ Rank 0 mới có quyền dọn dẹp các file sync sau khi tất cả đã vượt qua Barrier 2
+            if rank == 0:
+                for r in range(world_size):
+                    for prefix in ["emb_", "idx_", f"sync_{f_name}_"]:
+                        for ext in [".npy", ".pkl", ".txt"]:
+                            p = f"{tmp_sync_dir}/{prefix}{r}{ext}"
+                            if os.path.exists(p): os.remove(p)
+                os.remove(f"{tmp_sync_dir}/upload_done_{f_name}.txt")
+            
             gc.collect()
 
         except Exception as e:
