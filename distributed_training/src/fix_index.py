@@ -17,20 +17,22 @@ logger = logging.getLogger("fix_index")
 
 def get_npy_shape_gcs(fs, gcs_path):
     """
-    Đọc header của file .npy trên GCS để lấy shape mà không cần tải cả file lớn.
+    Đọc chuẩn header của file .npy từ GCS để lấy shape mà không tải toàn bộ dữ liệu.
     """
+    import numpy.lib.format as npy_format
     try:
         with fs.open(gcs_path, 'rb') as f:
-            # Chỉ đọc 128 bytes đầu tiên (đủ chứa header của numpy)
-            header = f.read(128)
-            with io.BytesIO(header) as bio:
-                # np.load có thể đọc từ stream, ta chỉ cần metadata
-                d = np.load(bio)
-                return d.shape
-    except Exception:
-        # Fallback nếu header phức tạp hơn
-        with fs.open(gcs_path, 'rb') as f:
-            return np.load(f, mmap_mode='r').shape
+            # Đọc magic string và version
+            version = npy_format.read_magic(f)
+            # Đọc header dựa trên version
+            if version == (1, 0):
+                shape, fortan, dtype = npy_format.read_array_header_1_0(f)
+            else:
+                shape, fortan, dtype = npy_format.read_array_header_2_0(f)
+            return shape
+    except Exception as e:
+        logger.error(f"Không thể đọc header NPY tại {gcs_path}: {e}")
+        raise e
 
 def run_index_rescue():
     """
