@@ -11,6 +11,9 @@ import pickle
 import gc
 import subprocess
 from datetime import timedelta
+import gcsfs
+import glob
+from src.gcs_manager import merge_precomputed_chunks
 
 def check_gcs_file_exists(gcs_path):
     """Kiểm tra sự tồn tại của file trên GCS."""
@@ -40,7 +43,7 @@ def precompute_item_embeddings():
     
     # 1. Khảo sát danh sách file
     path = TrainingConfig.GCS_ITEM_NODES if TrainingConfig.IS_CLOUD else "data/item_nodes"
-    import gcsfs
+    
     fs = gcsfs.GCSFileSystem() if TrainingConfig.IS_CLOUD else None
     
     if rank == 0:
@@ -49,7 +52,6 @@ def precompute_item_embeddings():
     if TrainingConfig.IS_CLOUD:
         all_files = sorted([f"gs://{f}" for f in fs.ls(path) if f.endswith(".parquet")])
     else:
-        import glob
         all_files = sorted(glob.glob(os.path.join(path, "*.parquet")))
 
     # 2. Chia Shard file
@@ -87,17 +89,38 @@ def precompute_item_embeddings():
             del table
             logger.info(f"  - Đã nạp {num_items:,} items. Bắt đầu mã hóa (Embedding)...")
 
-            # Encode
-            embs = model.encode(texts, batch_size=512, convert_to_numpy=True, show_progress_bar=False)
-            logger.info(f"  - Mã hóa xong! Thời gian: {time.time() - start_t:.1f}s. Đang lưu local...")
-            
-            # Index nội bộ có gắn Prefix để tránh xung đột
-            chunk_index = {}
-            for i, (p_id, asin, dom) in enumerate(zip(ids, asins, domains)):
+            # Lọc dữ liệu hợp lệ (Phải có ID và Text) để đảm bảo tỉ lệ 1:1
+            valid_texts = []
+            valid_prefixed_ids = []
+
+            for p_id, asin, dom, txt in zip(ids, asins, domains, texts):
+                if not txt: continue
                 if dom == 'amazon':
-                    if asin: chunk_index[f"amz_{asin}"] = i
+                    if asin:
+                        valid_prefixed_ids.append(f"amz_{asin}")
+                        valid_texts.append(txt)
                 else:
-                    if p_id: chunk_index[f"vn_{p_id}"] = i
+                    if p_id:
+                        valid_prefixed_ids.append(f"vn_{p_id}")
+                        valid_texts.append(txt)
+
+            num_valid_ids = len(valid_prefixed_ids)
+            if num_valid_ids == 0:
+                logger.warning(f"  - File {f_name} không có dữ liệu hợp lệ. Bỏ qua.")
+                continue
+
+            # Encode chỉ những items hợp lệ
+            embs = model.encode(valid_texts, batch_size=512, convert_to_numpy=True, show_progress_bar=False)
+            num_vectors = embs.shape[0]
+
+            # IN VÀ SO SÁNH NGAY LẬP TỨC
+            logger.info(f"  [CHECK] Chunk '{f_name}': IDs={num_valid_ids:,}, Vectors={num_vectors:,}")
+            if num_valid_ids != num_vectors:
+                logger.error(f"!!! LỖI NGHIÊM TRỌNG: Mismatch tại mảnh {f_name}. IDs ({num_valid_ids}) != Vectors ({num_vectors})")
+                raise ValueError(f"Integrity check failed for chunk {f_name}")
+
+            # Tạo Index 1:1
+            chunk_index = {pid: i for i, pid in enumerate(valid_prefixed_ids)}
             
             # Lưu local
             loc_npy = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.npy"
@@ -106,7 +129,7 @@ def precompute_item_embeddings():
             with open(loc_pkl, "wb") as f: pickle.dump(chunk_index, f)
             
             # Upload GCS
-            logger.info(f"  - Đang upload {f_name} lên GCS chunks...")
+            logger.info(f"  - Đang upload {f_name} lên GCS chunks (Đã kiểm tra 1:1)...")
             subprocess.run(["gsutil", "cp", loc_npy, f"{chunks_gcs_dir}/{f_name}.npy"], check=True)
             subprocess.run(["gsutil", "cp", loc_pkl, f"{chunks_gcs_dir}/{f_name}.pkl"], check=True)
             subprocess.run(["gsutil", "cp", "/dev/null", done_flag_gcs], check=True)
@@ -143,7 +166,7 @@ def precompute_item_embeddings():
             time.sleep(60)
 
         logger.info(">>> BẮT ĐẦU QUY TRÌNH HỢP NHẤT FILE TỔNG 12GB (Final Merge)...")
-        from src.gcs_manager import merge_precomputed_chunks
+        
         merge_precomputed_chunks()
         logger.info("==> CHÚC MỪNG! TOÀN BỘ QUY TRÌNH PRECOMPUTE ĐÃ THÀNH CÔNG RỰC RỠ!")
 

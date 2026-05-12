@@ -111,6 +111,15 @@ def merge_precomputed_chunks():
             
         curr_offset += n_rows
         
+        # KIỂM TRA LŨY KẾ SAU MỖI MẢNH
+        current_total_vectors = curr_offset
+        current_total_indices = len(final_index)
+        logger.info(f"  -> Lũy kế sau {npy_f}: Tổng Vector={current_total_vectors:,}, Tổng Index={current_total_indices:,}")
+        
+        if current_total_vectors != current_total_indices:
+            logger.error(f"!!! LỖI TOÀN VẸN KHI GỘP: Tại mảnh {npy_f}, tổng số lượng bị lệch!")
+            raise Exception(f"Merge corruption at chunk {npy_f}. Pipeline aborted.")
+            
         # Xóa mảnh local ngay sau khi gộp để giải phóng SSD
         os.remove(data_path)
         os.remove(pkl_path)
