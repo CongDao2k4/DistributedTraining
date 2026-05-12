@@ -23,9 +23,9 @@ class DSSMTrainingDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df[int(idx)]
-        # Bốc trực tiếp vector đã tính toán trước (Không cần BERT ở đây!)
-        q_emb = self.lookup.get_embedding(row['asin'])
-        p_emb = self.lookup.get_embedding(row['product_id'])
+        # Bốc trực tiếp vector đã tính toán trước (Sử dụng Prefix để tránh xung đột)
+        q_emb = self.lookup.get_embedding(f"amz_{row['asin']}")
+        p_emb = self.lookup.get_embedding(f"vn_{row['product_id']}")
         return torch.from_numpy(q_emb).float(), torch.from_numpy(p_emb).float()
 
 def evaluate_dssm(model, eval_pkl_path, text_encoder, device):

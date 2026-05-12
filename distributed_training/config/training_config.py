@@ -130,13 +130,14 @@ def setup_logging():
     warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub")
     logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
+    handlers = [logging.StreamHandler()]
+    if TrainingConfig.RANK == 0:
+        handlers.append(logging.FileHandler("training_pipeline.log", encoding="utf-8"))
+
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)s] [Rank %(rank)s] %(name)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("training_pipeline.log", encoding="utf-8")
-        ]
+        handlers=handlers
     )
     
     # Thêm RankFilter cho toàn bộ root logger

@@ -44,6 +44,10 @@ def upload_precomputed_data():
         logger.info("Đang upload bộ nhớ đệm Vector tổng lên GCS...")
         subprocess.run(["gsutil", "-m", "cp", emb_file, gcs_path], check=True)
         subprocess.run(["gsutil", "-m", "cp", idx_file, gcs_path], check=True)
+        
+        # Ghi cờ hoàn tất cuối cùng để các Rank khác biết
+        done_flag = f"{gcs_path}/_final_done.txt"
+        subprocess.run(["gsutil", "cp", "/dev/null", done_flag], check=True)
 
 def merge_precomputed_chunks():
     """

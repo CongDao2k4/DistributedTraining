@@ -24,9 +24,9 @@ class GCNTrainingDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df[int(idx)]
-        # Tra cứu trực tiếp vector (Thần tốc!)
-        q_emb = self.lookup.get_embedding(row['asin'])
-        p_emb = self.lookup.get_embedding(row['product_id'])
+        # Tra cứu trực tiếp vector (Sử dụng Prefix để tránh xung đột)
+        q_emb = self.lookup.get_embedding(f"amz_{row['asin']}")
+        p_emb = self.lookup.get_embedding(f"vn_{row['product_id']}")
         return torch.from_numpy(q_emb).float(), torch.from_numpy(p_emb).float()
 
 def evaluate_gcn(model, eval_pkl_path, text_encoder, device):

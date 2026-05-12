@@ -78,10 +78,11 @@ def precompute_item_embeddings():
             # Đọc file
             start_t = time.time()
             logger.info(f"  - Đang nạp dữ liệu từ GCS...")
-            table = pq.read_table(f_path, columns=['product_id', 'asin', 'full_text'], filesystem=fs)
+            table = pq.read_table(f_path, columns=['product_id', 'asin', 'full_text', 'domain'], filesystem=fs)
             texts = table['full_text'].to_pylist()
             ids = table['product_id'].to_pylist()
             asins = table['asin'].to_pylist()
+            domains = table['domain'].to_pylist()
             num_items = len(texts)
             del table
             logger.info(f"  - Đã nạp {num_items:,} items. Bắt đầu mã hóa (Embedding)...")
@@ -90,11 +91,13 @@ def precompute_item_embeddings():
             embs = model.encode(texts, batch_size=512, convert_to_numpy=True, show_progress_bar=False)
             logger.info(f"  - Mã hóa xong! Thời gian: {time.time() - start_t:.1f}s. Đang lưu local...")
             
-            # Index nội bộ
+            # Index nội bộ có gắn Prefix để tránh xung đột
             chunk_index = {}
-            for i, (p_id, asin) in enumerate(zip(ids, asins)):
-                if p_id: chunk_index[p_id] = i
-                if asin: chunk_index[asin] = i
+            for i, (p_id, asin, dom) in enumerate(zip(ids, asins, domains)):
+                if dom == 'amazon':
+                    if asin: chunk_index[f"amz_{asin}"] = i
+                else:
+                    if p_id: chunk_index[f"vn_{p_id}"] = i
             
             # Lưu local
             loc_npy = f"{TrainingConfig.LOCAL_DATA_DIR}/{f_name}.npy"
@@ -110,7 +113,7 @@ def precompute_item_embeddings():
             
             # Cleanup
             os.remove(loc_npy); os.remove(loc_pkl)
-            del embs, texts, ids, asins
+            del embs, texts, ids, asins, domains
             gc.collect()
             logger.info(f" [DONE] >>> Hoàn tất file: {f_name}")
             logger.info("---------------------------------------------------------")
@@ -145,7 +148,19 @@ def precompute_item_embeddings():
         logger.info("==> CHÚC MỪNG! TOÀN BỘ QUY TRÌNH PRECOMPUTE ĐÃ THÀNH CÔNG RỰC RỠ!")
 
     if world_size > 1:
-        dist.barrier()
+        if rank != 0:
+            logger.info("Đang đợi Rank 0 hoàn tất quy trình hợp nhất (Final Merge)...")
+            final_done_flag = f"{TrainingConfig.GCS_PREPARED_DATA}/_final_done.txt"
+            max_wait = 7200 # 2 tiếng
+            elapsed = 0
+            while not check_gcs_file_exists(final_done_flag) and elapsed < max_wait:
+                time.sleep(60)
+                elapsed += 60
+                if elapsed % 300 == 0:
+                    logger.info(f"  - Vẫn đang đợi Rank 0... ({elapsed//60} phút)")
+        else:
+            # Rank 0 đã xong
+            pass
 
 if __name__ == "__main__":
     precompute_item_embeddings()

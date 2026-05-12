@@ -89,11 +89,25 @@ def main():
         print(f"   World Size: {TrainingConfig.WORLD_SIZE} | Mode: {args.baseline}")
         print("="*60 + "\n")
 
-    if not args.skip_download and TrainingConfig.RANK == 0:
-        try: download_training_data()
-        except Exception as e: logger.error(f"Lỗi tải dữ liệu: {e}"); cleanup_distributed(); return
-    
-    dist.barrier()
+    # Thay thế dist.barrier() cứng nhắc bằng vòng lặp kiểm tra file (Tránh NCCL Timeout)
+    if TrainingConfig.RANK != 0:
+        import time
+        logger.info(f"Rank {TrainingConfig.RANK} đang đợi dữ liệu được đồng bộ từ Rank 0...")
+        max_wait = 3600  # Đợi tối đa 1 tiếng
+        elapsed = 0
+        while not os.path.exists(TrainingConfig.ITEM_EMBEDDINGS_PATH) and elapsed < max_wait:
+            time.sleep(10)
+            elapsed += 10
+            if elapsed % 60 == 0:
+                logger.info(f"  - Vẫn đang đợi... ({elapsed//60} phút)")
+        
+        if not os.path.exists(TrainingConfig.ITEM_EMBEDDINGS_PATH):
+            logger.error("Quá thời gian chờ tải dữ liệu (Timeout).")
+            cleanup_distributed(); return
+    else:
+        # Rank 0 đợi một chút để đảm bảo file system đã flush (quan trọng trên NFS/Cloud)
+        import time
+        time.sleep(5)
 
     if args.baseline == "all":
         baselines_to_run = [1, 2, 3, 4, 5, 6]
