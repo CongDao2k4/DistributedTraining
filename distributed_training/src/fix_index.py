@@ -1,13 +1,15 @@
 import os
+import sys
 import logging
 import pickle
 import gcsfs
 import pyarrow.parquet as pq
 import numpy as np
 import io
+import subprocess
+
 from config.training_config import TrainingConfig
 from tqdm import tqdm
-import subprocess
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -52,7 +54,8 @@ def run_index_rescue():
 
     # 2. Duyệt qua từng file để xây dựng lại Mapping
     for idx, p_path in enumerate(tqdm(all_parquets, desc="Sửa file pkl con")):
-        f_name = f"chunk_{idx}"
+        # Lấy tên file gốc (ví dụ: part-00000...) để khớp với output của precompute
+        f_name = os.path.basename(p_path).replace(".parquet", "")
         npy_path = f"{chunks_path}/{f_name}.npy"
         pkl_con_path = f"{chunks_path}/{f_name}.pkl"
 

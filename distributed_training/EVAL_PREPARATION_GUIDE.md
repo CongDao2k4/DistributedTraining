@@ -36,8 +36,8 @@ git clone [LINK_GITHUB_CUA_BAN]
 cd ~/MiningMassiveData/distributed_training
 
 # 2. Tạo và kích hoạt môi trường ảo
-python3 -m venv eval_env
-source eval_env/bin/activate
+python3 -m venv eval_env  # hoặc fix_venv với chạy file fix_index.py
+source eval_env/bin/activate  # source fix_venv/bin/activate với chạy file fix_index.py
 
 # 3. Nâng cấp pip
 pip install --upgrade pip
